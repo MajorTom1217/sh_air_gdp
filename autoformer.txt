@@ -1,0 +1,189 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch.utils.data import DataLoader, TensorDataset
+import math
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ========== 1. 数据读取与处理 ==========
+data = pd.read_excel(r"D:\\Documents\\Desktop\\建模比赛\\数据\\上海（合并）.xlsx")
+data["Date"] = pd.to_datetime(data["Date"])
+
+# 时间编码
+for col in ["Month", "Week", "Quarter"]:
+    if col == "Month":
+        data["Month_sin"] = np.sin(2 * np.pi * data["Date"].dt.month / 12)
+        data["Month_cos"] = np.cos(2 * np.pi * data["Date"].dt.month / 12)
+    elif col == "Week":
+        data["Week_sin"] = np.sin(2 * np.pi * data["Date"].dt.dayofweek / 7)
+        data["Week_cos"] = np.cos(2 * np.pi * data["Date"].dt.dayofweek / 7)
+    elif col == "Quarter":
+        data["Quarter_sin"] = np.sin(2 * np.pi * (data["Date"].dt.quarter - 1) / 4)
+        data["Quarter_cos"] = np.cos(2 * np.pi * (data["Date"].dt.quarter - 1) / 4)
+
+# 添加特征
+lag_days = 3
+window_size = 5
+for col in ["pm25_1", "平均气温", "湿度"]:
+    for lag in range(1, lag_days+1):
+        data[f"{col}_lag_{lag}"] = data[col].shift(lag)
+data["pm25_1_MA5"] = data["pm25_1"].rolling(window=window_size).mean()
+data = data.iloc[lag_days + window_size - 1:].reset_index(drop=True)
+
+for col in ["pm10", "o3", "no2", "so2", "co"]:
+    data[col] = data[col].interpolate(method="linear")
+
+data["Day"] = data["Date"].dt.day
+holiday = (data["Date"].dt.month == 10) & (data["Date"].dt.day == 1) | (data["Date"].dt.month == 5) & (data["Date"].dt.day == 1)
+data["IsHoliday"] = holiday.astype(int)
+
+features = ["能见度", "pm10", "no2", "so2", "co", "风速m/s",
+            "Month_sin", "Month_cos", "Week_sin", "Week_cos", "Day",
+            "pm25_1_lag_1", "pm25_1_MA5", "GDP-SH_Index"]
+target = "pm25_1"
+
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data[features + [target]])
+data = pd.DataFrame(data_scaled, columns=features + [target])
+
+# ========== 2. 序列构造 ==========
+seq_len = 12
+pred_len = 1
+
+X, y = [], []
+data_np = data.values
+for i in range(len(data_np) - seq_len - pred_len):
+    X.append(data_np[i:i+seq_len, :-1])
+    y.append(data_np[i+seq_len:i+seq_len+pred_len, -1])
+X = np.array(X)
+y = np.array(y).squeeze()
+
+split = int(len(X) * 0.8)
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
+test_ds = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.float32))
+
+train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+
+# ========== 3. Autoformer 模型 ==========
+class AutoCorrelationLayer(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        Q, K, V = self.query(x), self.key(x), self.value(x)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Q.size(-1))
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, V)
+        return out
+
+class AutoformerBlock(nn.Module):
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        self.acf = AutoCorrelationLayer(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.ReLU(),
+            nn.Linear(d_model * 4, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x2 = self.acf(x)
+        x = self.norm1(x + self.dropout(x2))
+        x2 = self.ff(x)
+        x = self.norm2(x + self.dropout(x2))
+        return x
+
+class Autoformer(nn.Module):
+    def __init__(self, input_size, d_model=64, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(input_size, d_model)
+        self.blocks = nn.Sequential(*[AutoformerBlock(d_model, dropout) for _ in range(num_layers)])
+        self.output = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.blocks(x)
+        out = self.output(x[:, -1, :])  # 取最后一个时间步
+        return out.squeeze()
+
+# ========== 4. 模型训练与评估 ==========
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = Autoformer(input_size=len(features)).to(device)
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+def train_model(model, train_loader, test_loader, epochs=100):
+    best_loss = float('inf')
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                out = model(xb)
+                val_loss += criterion(out, yb).item()
+        print(f"Epoch {epoch+1}, Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss/len(test_loader):.4f}")
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(model.state_dict(), "best_autoformer.pth")
+
+train_model(model, train_loader, test_loader)
+
+# ========== 5. 预测与评估 ==========
+model.load_state_dict(torch.load("best_autoformer.pth"))
+model.eval()
+
+preds = []
+with torch.no_grad():
+    for xb, _ in test_loader:
+        xb = xb.to(device)
+        out = model(xb)
+        preds.extend(out.cpu().numpy())
+
+# 反标准化
+X_test_flat = X_test[:, -1, :]
+y_test_real = scaler.inverse_transform(np.column_stack((X_test_flat, y_test)))[:, -1]
+y_pred_real = scaler.inverse_transform(np.column_stack((X_test_flat, preds)))[:, -1]
+
+print(f"MAE: {mean_absolute_error(y_test_real, y_pred_real):.2f}")
+print(f"MSE: {mean_squared_error(y_test_real, y_pred_real):.2f}")
+print(f"R²: {r2_score(y_test_real, y_pred_real):.4f}")
+
+plt.figure(figsize=(12, 6))
+plt.plot(y_test_real, label="真实值", alpha=0.7)
+plt.plot(y_pred_real, label="预测值", alpha=0.7)
+plt.title("pm2.5预测结果对比（Autoformer）")
+plt.xlabel("时间步")
+plt.ylabel("pm2.5")
+plt.legend()
+plt.show()

@@ -1,0 +1,192 @@
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch.utils.data import DataLoader, TensorDataset
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+
+data = pd.read_excel(r"D:\\Documents\\Desktop\\建模比赛\\数据\\上海（合并）.xlsx")
+# 参数
+seq_length = 12
+input_size = 14
+hidden_size = 80
+num_layers = 1
+trans_layers = 2
+num_heads = 4
+batch_size = 100
+dropout = 0.3
+learning_rate = 0.0005
+epochs = 200
+patience = 30
+
+
+data["Date"] = pd.to_datetime(data["Date"])
+
+# 时间编码
+data["Month_sin"] = np.sin(2 * np.pi * data["Date"].dt.month / 12)
+data["Month_cos"] = np.cos(2 * np.pi * data["Date"].dt.month / 12)
+data["Week_sin"] = np.sin(2 * np.pi * data["Date"].dt.dayofweek / 7)
+data["Week_cos"] = np.cos(2 * np.pi * data["Date"].dt.dayofweek / 7)
+data["Quarter_sin"] = np.sin(2 * np.pi * (data["Date"].dt.quarter - 1) / 4)
+data["Quarter_cos"] = np.cos(2 * np.pi * (data["Date"].dt.quarter - 1) / 4)
+
+# 滞后与滑动特征
+lag_days = 3
+window_size = 5
+for col in ["pm25_1", "平均气温", "湿度"]:
+    for lag in range(1, lag_days+1):
+        data[f"{col}_lag_{lag}"] = data[col].shift(lag)
+data["pm25_1_MA5"] = data["pm25_1"].rolling(window=window_size).mean()
+
+# 缺失值插值
+data = data.iloc[lag_days + window_size - 1:].reset_index(drop=True)
+for col in ["pm10", "o3", "no2", "so2", "co"]:
+    data[col] = data[col].interpolate(method="linear")
+
+# 假日特征
+data["Day"] = data["Date"].dt.day
+data["National_Day"] = (data["Date"].dt.month == 10) & (data["Date"].dt.day == 1)
+data["Labor_Day"] = (data["Date"].dt.month == 5) & (data["Date"].dt.day == 1)
+data["IsHoliday"] = (data["National_Day"] | data["Labor_Day"]).astype(int)
+data = data.drop(["National_Day", "Labor_Day"], axis=1)
+
+# 特征选择
+features = ["能见度","pm10","no2","so2","co","风速m/s",
+    "Month_sin", "Month_cos", "Week_sin", "Week_cos","Day",
+    "pm25_1_lag_1","pm25_1_MA5","GDP-SH_Index"]
+target = "pm25_1"
+
+# ===================== 2. 标准化与序列构造 =====================
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data[features + [target]])
+data = pd.DataFrame(data_scaled, columns=features + [target])
+
+seq_length = 12
+
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i+seq_length, :-1])
+        y.append(data[i+seq_length, -1])
+    return np.array(X), np.array(y)
+
+X, y = create_sequences(data.values, seq_length)
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+
+train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
+test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.float32))
+
+train_loader = DataLoader(train_dataset, batch_size=100, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=100, shuffle=False)
+
+# =====================  模型 =====================
+class TransformerLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, trans_layers, num_heads, dropout):
+        super().__init__()
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer=nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_heads, dropout=dropout, batch_first=True),
+            num_layers=trans_layers
+        )
+        self.lstm = nn.LSTM(input_size=hidden_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.fc = nn.Sequential(
+                  nn.Linear(hidden_size, hidden_size),
+                  nn.ReLU(),
+                  nn.BatchNorm1d(hidden_size),
+                  nn.Linear(hidden_size, hidden_size // 2),
+                  nn.ReLU(),
+                  nn.Linear(hidden_size // 2, 1)
+                  )   
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.layer_norm(x)
+        trans_out = self.transformer(x)
+        lstm_out, _ = self.lstm(trans_out)
+        output = self.fc(lstm_out[:, -1, :]).squeeze()
+        return output
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = TransformerLSTM(input_size, hidden_size, num_layers, trans_layers, num_heads, dropout).to(device)
+
+#训练
+criterion = nn.SmoothL1Loss()
+optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-6)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, epochs, patience):
+    best_loss = float('inf')
+    early_stop = 0
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(X_batch), y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+        scheduler.step()
+        
+        # 计算验证集 loss
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in test_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                output = model(X_batch)
+                val_loss += criterion(output, y_batch).item()
+        val_loss /= len(test_loader)
+        
+        print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        
+        if val_loss < best_loss:
+            best_loss = val_loss
+            early_stop = 0
+            torch.save(model.state_dict(), "best_model.pth")
+        else:
+            early_stop += 1
+            if early_stop >= patience:
+                print("Early stopping")
+                break
+
+train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, epochs, patience)
+
+
+# ===================== 5. 预测与评估 =====================
+model.load_state_dict(torch.load("best_model.pth"))
+model.eval()
+y_pred = []
+with torch.no_grad():
+    for X_batch, _ in test_loader:
+        X_batch = X_batch.to(device)
+        output = model(X_batch)
+        y_pred.extend(output.cpu().numpy())
+
+# 反标准化
+y_test_real = scaler.inverse_transform(np.column_stack((X_test[:, -1, :], y_test)))[:, -1]
+y_pred_real = scaler.inverse_transform(np.column_stack((X_test[:, -1, :], y_pred)))[:, -1]
+
+print(f"MAE: {mean_absolute_error(y_test_real, y_pred_real):.2f}")
+print(f"MSE: {mean_squared_error(y_test_real, y_pred_real):.2f}")
+print(f"R²: {r2_score(y_test_real, y_pred_real):.4f}")
+
+plt.figure(figsize=(12, 6))
+plt.plot(y_test_real, label="真实值", alpha=0.7)
+plt.plot(y_pred_real, label="预测值", alpha=0.7)
+plt.title("pm2.5预测结果对比")
+plt.xlabel("时间步")
+plt.ylabel("pm2.5")
+plt.legend()
+plt.show()

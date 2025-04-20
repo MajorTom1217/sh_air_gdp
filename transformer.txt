@@ -1,0 +1,191 @@
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch.utils.data import DataLoader, TensorDataset
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
+
+data = pd.read_excel(r"D:\\Documents\\Desktop\\建模比赛\\数据\\上海（合并）.xlsx")
+# 参数
+seq_length = 12
+input_size = 14
+hidden_size = 80
+num_layers = 1
+trans_layers = 2
+num_heads = 4
+batch_size = 100
+dropout = 0.3
+learning_rate = 0.0005
+epochs = 200
+patience = 30
+data["Date"] = pd.to_datetime(data["Date"])
+
+# 时间编码
+data["Month_sin"] = np.sin(2 * np.pi * data["Date"].dt.month / 12)
+data["Month_cos"] = np.cos(2 * np.pi * data["Date"].dt.month / 12)
+data["Week_sin"] = np.sin(2 * np.pi * data["Date"].dt.dayofweek / 7)
+data["Week_cos"] = np.cos(2 * np.pi * data["Date"].dt.dayofweek / 7)
+data["Quarter_sin"] = np.sin(2 * np.pi * (data["Date"].dt.quarter - 1) / 4)
+data["Quarter_cos"] = np.cos(2 * np.pi * (data["Date"].dt.quarter - 1) / 4)
+
+lag_days = 3
+window_size = 5
+for col in ["pm25_1", "平均气温", "湿度"]:
+    for lag in range(1, lag_days+1):
+        data[f"{col}_lag_{lag}"] = data[col].shift(lag)
+data["pm25_1_MA5"] = data["pm25_1"].rolling(window=window_size).mean()
+
+# 缺失值填充
+data = data.iloc[lag_days + window_size - 1:].reset_index(drop=True)
+for col in ["pm10", "o3", "no2", "so2", "co"]:
+    data[col] = data[col].interpolate(method="linear")
+
+# 特征选择
+data["Day"] = data["Date"].dt.day
+data["National_Day"] = (data["Date"].dt.month == 10) & (data["Date"].dt.day == 1)
+data["Labor_Day"] = (data["Date"].dt.month == 5) & (data["Date"].dt.day == 1)
+data["IsHoliday"] = (data["National_Day"] | data["Labor_Day"]).astype(int)
+data = data.drop(["National_Day", "Labor_Day"], axis=1)
+
+features = ["能见度","pm10","no2","so2","co","风速m/s",
+            "Month_sin", "Month_cos", "Week_sin", "Week_cos","Day",
+            "pm25_1_lag_1","pm25_1_MA5","GDP-SH_Index"]
+target = "pm25_1"
+
+# 标准化
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data[features + [target]])
+data = pd.DataFrame(data_scaled, columns=features + [target])
+
+# 构造时间序列数据
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i+seq_length, :-1])
+        y.append(data[i+seq_length, -1])
+    return np.array(X), np.array(y)
+
+seq_length = 12
+X, y = create_sequences(data.values, seq_length)
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+
+train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
+test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.float32))
+
+train_loader = DataLoader(train_dataset, batch_size=100, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=100, shuffle=False)
+
+# ========== Transformer模型 + 位置编码 ==========
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return x
+
+class PureTransformer(nn.Module):
+    def __init__(self, input_size, hidden_size, trans_layers, num_heads, dropout):
+        super().__init__()
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        self.pos_encoder = PositionalEncoding(hidden_size)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_heads, dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=trans_layers)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        output = self.fc(x[:, -1, :]).squeeze()
+        return output
+
+# ========== 模型训练 ==========
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = PureTransformer(input_size=input_size, hidden_size=hidden_size, trans_layers=trans_layers, num_heads=num_heads, dropout=dropout).to(device)
+
+criterion = nn.SmoothL1Loss()
+optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-6)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+
+def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, epochs=200, patience=30):
+    best_loss = float('inf')
+    early_stop = 0
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(X_batch), y_batch)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+        scheduler.step()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in test_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                val_loss += criterion(model(X_batch), y_batch).item()
+        val_loss /= len(test_loader)
+
+        print(f"Epoch {epoch+1} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        if val_loss < best_loss:
+            best_loss = val_loss
+            early_stop = 0
+            torch.save(model.state_dict(), "best_transformer.pth")
+        else:
+            early_stop += 1
+            if early_stop >= patience:
+                print("Early stopping")
+                break
+
+train_model(model, train_loader, test_loader, criterion, optimizer, scheduler)
+
+# ========== 模型预测与评估 ==========
+model.load_state_dict(torch.load("best_transformer.pth"))
+model.eval()
+y_pred = []
+with torch.no_grad():
+    for X_batch, _ in test_loader:
+        X_batch = X_batch.to(device)
+        output = model(X_batch)
+        y_pred.extend(output.cpu().numpy())
+
+y_test_real = scaler.inverse_transform(np.column_stack((X_test[:, -1, :], y_test)))[:, -1]
+y_pred_real = scaler.inverse_transform(np.column_stack((X_test[:, -1, :], y_pred)))[:, -1]
+
+print(f"MAE: {mean_absolute_error(y_test_real, y_pred_real):.2f}")
+print(f"MSE: {mean_squared_error(y_test_real, y_pred_real):.2f}")
+print(f"R²: {r2_score(y_test_real, y_pred_real):.4f}")
+
+plt.figure(figsize=(12, 6))
+plt.plot(y_test_real, label="真实值", alpha=0.7)
+plt.plot(y_pred_real, label="预测值", alpha=0.7)
+plt.title("pm2.5预测结果对比 - Transformer")
+plt.xlabel("时间步")
+plt.ylabel("pm2.5")
+plt.legend()
+plt.show()
